@@ -158,6 +158,22 @@ const PDF_WORKER_URL =
 
 const MIN_RETRIEVAL_SIMILARITY = 0.02;
 
+const FOLLOW_UP_PHRASES = [
+  'elaborate',
+  'tell me more',
+  'explain further',
+  'what did you mean',
+  'can you explain',
+  'more detail',
+  'go on',
+  'continue',
+  'and then',
+  'what about',
+  'how about',
+  'why is that',
+  'how so',
+];
+
 const GEMINI_MODEL_FALLBACKS = [
   'gemini-2.5-flash-lite',
   'gemini-2.5-flash',
@@ -578,6 +594,58 @@ function confidenceFromTopScores(topScores) {
   };
 }
 
+function isFollowUpQuestion(query) {
+  const lower = String(query).toLowerCase();
+  return FOLLOW_UP_PHRASES.some((phrase) => lower.includes(phrase));
+}
+
+/**
+ * @param {{ role: string; content: string }[]} messages
+ * @returns {{ role: string; content: string } | null}
+ */
+function getLastAssistantMessage(messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role === 'assistant' && m.content?.trim()) {
+      return m;
+    }
+  }
+  return null;
+}
+
+/** Key topic tokens from the start of the prior assistant answer (for retrieval). */
+function extractRetrievalTopicsFromAssistantMessage(content) {
+  const excerpt = String(content)
+    .replace(/\*\*/g, '')
+    .slice(0, 200)
+    .trim();
+  const tokens = tokenize(excerpt);
+  if (tokens.length > 0) return tokens.join(' ');
+  return excerpt;
+}
+
+/**
+ * @param {string} userQuery
+ * @param {{ role: string; content: string }[]} chatHistory messages before the current user turn
+ * @returns {{ retrievalQuery: string; isFollowUp: boolean }}
+ */
+function resolveRetrievalQuery(userQuery, chatHistory) {
+  if (!isFollowUpQuestion(userQuery)) {
+    return { retrievalQuery: userQuery, isFollowUp: false };
+  }
+  const lastAssistant = getLastAssistantMessage(chatHistory);
+  if (!lastAssistant) {
+    return { retrievalQuery: userQuery, isFollowUp: false };
+  }
+  const topics = extractRetrievalTopicsFromAssistantMessage(
+    lastAssistant.content,
+  );
+  if (!topics.trim()) {
+    return { retrievalQuery: userQuery, isFollowUp: false };
+  }
+  return { retrievalQuery: topics, isFollowUp: true };
+}
+
 /** Normalize query text before retrieval; typos are kept as typed. */
 function preprocessQueryForRetrieval(query) {
   return String(query)
@@ -698,6 +766,7 @@ function retrieveRelevantChunks(query, allChunks, topK = 7, idfMap) {
  * @param {{ text: string; docName: string; page: number }[]} relevantChunks
  * @param {{ role: string; content: string }[]} chatHistory
  * @param {{ onWait?: (label: string) => void; onWaitEnd?: () => void; onApiStart?: () => void }} [callbacks]
+ * @param {{ isFollowUp?: boolean }} [options]
  * @returns {Promise<string>}
  */
 async function answerQuestion(
@@ -705,8 +774,10 @@ async function answerQuestion(
   relevantChunks,
   chatHistory,
   callbacks = {},
+  options = {},
 ) {
   const { onWait, onWaitEnd, onApiStart } = callbacks;
+  const { isFollowUp = false } = options;
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 
   return enqueueGeminiRequest(async () => {
@@ -717,9 +788,15 @@ async function answerQuestion(
       )
       .join('\n\n---\n\n');
 
+    const followUpInstruction = isFollowUp
+      ? `The user is asking a follow-up question about your previous response. Use the conversation history to understand context and elaborate on what was previously discussed.
+
+`
+      : '';
+
     const systemPrompt = `You are a document analysis assistant. Answer questions using ONLY the document excerpts below.
 
-RULES:
+${followUpInstruction}RULES:
 - Read every excerpt carefully. If any excerpt contains facts, definitions, measurements, or lists that answer the question (even partially), you MUST include them in your answer.
 - When the question asks for "types", list each type named in the excerpts with its description from the text.
 - Cite sources (e.g., "According to Source 2...").
@@ -1380,8 +1457,13 @@ export default function ContextAwareDocQABot() {
         setChatHistory(afterUser);
         setQueryInput('');
 
-        const { results, confidence } = retrieveRelevantChunks(
+        const { retrievalQuery, isFollowUp } = resolveRetrievalQuery(
           q,
+          chatHistory,
+        );
+
+        const { results, confidence } = retrieveRelevantChunks(
+          retrievalQuery,
           flatChunks,
           7,
           corpusIdf,
@@ -1465,6 +1547,7 @@ export default function ContextAwareDocQABot() {
                 setIsAwaitingClaude(true);
               },
             },
+            { isFollowUp },
           );
           didCallGemini = true;
           setChatHistory((prev) => [
